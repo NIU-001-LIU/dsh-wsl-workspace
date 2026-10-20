@@ -45,7 +45,7 @@ const STYLES = `
 /* Same box as the shell's own footer actions: the base rule's 50% radius resolves per axis,
    so a wide box needs the length restated or it draws an ellipse. */
 .dww-action--wide {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   width: 100%;
   height: 42px;
   padding: 0 10px 0 8px;
@@ -53,6 +53,7 @@ const STYLES = `
   border-radius: 12px;
   font-size: 14px;
   line-height: 22px;
+  white-space: nowrap;
 }
 /* The base rule is the dimmed rail tone. */
 .dww-action--rail,
