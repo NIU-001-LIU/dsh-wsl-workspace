@@ -41,19 +41,25 @@ const STYLES = `
 .dww-action--rail {
   width: 36px;
   height: 36px;
-  color: var(--dsw-alias-label-primary);
 }
-/* The wide counterpart of the rail button: the same control in the dialog's header, where it is
-   laid out by the container rather than by a fixed box. It existed only as the wide/rail branch of
-   the className in AddWslWorkspace.tsx with no rule behind it, so the wide form silently inherited
-   the base .dww-action padding at the dialog's density — which is where the "the dialog's button
-   looks smaller than the sidebar's" report came from. */
+/* The wide form shares the sidebar-foot row with the shell's own actions ("移动访问",
+   "导入会话"): the same 42px box, 12px radius, full width, mark + label. The base rule's
+   50% radius targets the 36×36 rail button; on a wide box it resolves to an ellipse, which
+   is why the radius is restated as a length here. */
 .dww-action--wide {
-  width: auto;
-  min-width: 96px;
-  height: 32px;
-  padding: 0 12px;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 42px;
+  padding: 0 10px 0 8px;
+  gap: 8px;
+  justify-content: flex-start;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 22px;
 }
+/* Both expanded forms label in the primary tone; the base rule is the dimmed rail tone. */
+.dww-action--rail,
+.dww-action--wide { color: var(--dsw-alias-label-primary); }
 .dww-action svg { flex: none; }
 
 /* The W letter mark of the sidebar action (sized for wide/rail buttons). */
@@ -65,6 +71,21 @@ const STYLES = `
   user-select: none;
 }
 .dww-action--rail .dww-letter { font-size: 17px; }
+/* Each neighbouring action puts a 16px icon before its label, so their labels begin at
+   8 + 16 + 8 = 32px. The W is a text glyph advancing ~13.5px, which started this label early
+   and left the mark flush against the edge. The same 16px box, glyph centred, puts the label
+   on 32px and gives the W its leading room without a padding special case. */
+.dww-action--wide .dww-letter {
+  flex: none;
+  width: 16px;
+  text-align: center;
+}
+.dww-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
 
 /* Full-viewport overlay + centered card (mirrors the platform Mask/Dialog). */
 .dww-overlay {

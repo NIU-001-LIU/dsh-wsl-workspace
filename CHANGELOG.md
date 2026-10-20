@@ -2,7 +2,37 @@
 
 All notable changes to `dsh-wsl-workspace`, newest first. Back to the [README](README.md); the Chinese record is [CHANGELOG.zh.md](CHANGELOG.zh.md).
 
+## 0.7.9 — 2026-10-20
+- **The sidebar action stops being an ellipse, and joins the row it sits in.** `.dww-action--wide`
+  set a width, a height and padding but no radius, so it inherited the base rule's `border-radius:
+  50%` — and 50% resolves against each axis, not against the shorter side. A 96×32 box therefore
+  drew a 48×16 ellipse. The rule now states `12px` as a length, takes the 42px height and
+  `width: 100%` the shell's own footer actions use ("移动访问", "导入会话"), and carries the same
+  `0 10px 0 8px` padding, so the three stack as one column instead of one rounded rectangle beside
+  a lozenge.
+- **The label reaches the same 32px start the neighbouring actions use.** Those put a 16px icon
+  before their text (`8 + 16 + 8`). The W is a text glyph whose advance is ~13.5px, so the label
+  began ~2.5px early and the mark sat flush against the edge. The glyph now occupies a 16px box of
+  its own and is centred in it, which lands the label on 32px and gives the W its leading room
+  without a padding special case. The wide form also gained the label itself, reading
+  `WSL工作区` — the `action.add` key already existed for it and had no caller.
+- **The trigger stays mounted while the dialog is open.** The component returned `button` when
+  `open` was false and the overlay otherwise, so opening the dialog unmounted the button: the
+  footer row collapsed and the elements under it jumped up, then jumped back on close, and the
+  anchor the user had just clicked was gone. Both are returned together now. Because the dialog
+  declares `aria-modal="true"`, the button behind it takes `aria-hidden` and `tabIndex={-1}` while
+  open rather than staying reachable by Tab.
+- **A healthy install no longer shows an empty error strip.** `checkPreset` answers `undefined`
+  when every variant is healthy, and the open pass passed that straight to `setError`, whose state
+  is `string | null`. `undefined !== null` is true, so the strip rendered on *every* open of a
+  working install as a bordered row holding nothing but its Retry button. The value is folded to
+  `null` at the call site, and the render condition now requires text rather than the absence of
+  `null`, so a blank message from any future path cannot draw the row either. TypeScript would
+  have caught the first half (`TS2345` under `strict`) — `tsdown` transpiles without checking
+  types, so no gate did.
+
 ## 0.7.8 — 2026-10-20
+
 
 **This release ships what 0.7.7's own record already described.** The 0.7.7 tarball on the registry was built
 before those fixes landed; [#85](https://github.com/dsh-wsl-workspace-maintainers/dsh-wsl-workspace/pull/85)
