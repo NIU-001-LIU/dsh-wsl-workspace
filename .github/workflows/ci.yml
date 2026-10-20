@@ -1,0 +1,386 @@
+name: checks
+# Unified entry: every run step below is the same `npm run …` the README of
+# TESTING.md and docs/CHECK-CATALOG.md advertise for local use.
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One group per **branch**, not per ref. A push carries `refs/heads/<branch>` and a pull_request
+  # carries `refs/pull/<n>/merge`, so grouping on `github.ref` put the two events in different groups
+  # and every push ran the whole workflow twice — eight WSL jobs where four were meant, on runners that
+  # were already saturated. The duplicated run is also the one that stalls: runs #151/#153 sat with
+  # jobs `in_progress` and no output while their twin (#152/#154, same content) finished in 7 min 48 s.
+  #
+  # `head_ref` is the source branch on a pull_request and empty on a push; `ref_name` is the branch
+  # name on a push. Either way both events land on the same key, so the second one cancels the first
+  # and a push reports exactly one run.
+  group: checks-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  lint-build:
+    name: gates on the committed artifact plane (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: committed lib/ is what HEAD says it is (before anything can rewrite it)
+        run: node scripts/verify-lib-sync.mjs --check-only
+      - name: verify-lib on the committed lib/
+        run: npm run verify
+      - name: pure-node unit bucket
+        run: npm run test:unit
+      - name: rebuild must reproduce the committed lib/ byte-for-byte
+        run: |
+          npm run build
+          if ! git diff --quiet -- lib; then
+            echo "RED — lib/ in HEAD is not what a build of HEAD's src/ produces:"
+            git diff --stat -- lib
+            exit 1
+          fi
+      - name: artifact identity (three packs agree; TESTING.md contract)
+        run: node scripts/verify-artifact-identity.mjs
+      - name: documentation parity (declared README sections, shared facts, link graph)
+        run: npm run test:docs
+      - name: release behaviour matrix shape (rows, verdicts, ledger lines)
+        # The document a version is gated on, read by code: its rows, its verdicts and the ledger line
+        # a DEFECT owes. `--self-test` re-runs the audit over four mutated copies every frame, so the
+        # gate cannot rot into one that has only ever been seen green.
+        run: |
+          npm run test:matrix
+          node scripts/check-release-matrix.mjs --self-test
+
+  runtime-tests:
+    name: node buckets against the pinned host tree (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint-build
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: install pinned @deepseek-ai host packages
+        run: node ci/install-pinned.mjs
+      - name: node bucket (build + host-package tests + host pair + rank --strict)
+        run: npm run test:node
+      - name: typecheck does not grow past its recorded baseline
+        run: node scripts/typecheck-gate.mjs
+      - name: clean npm install of the packed tarball
+        run: npm run verify:install
+      # Expected green, and it runs where a green belongs: after `verify:install`, before the
+      # one red-by-design step below. #47's profile-shaped arms.
+      - name: profile-shaped isolation (#47 call-time peer imports)
+        run: npm run test:profile
+      # LAST, on purpose. A failing step skips everything after it, and this step is red by
+      # design until #44 §6 is fixed — frame 36797162445 proves the cost of getting this wrong:
+      # with the seam step in the middle, `typecheck does not grow past its recorded baseline`
+      # and `clean npm install of the packed tarball` both came back `skipped`. A known red is
+      # allowed to be the frame's verdict, not to silence the gates behind it. It aggregates the
+      # two seam suites through `scripts/run-seams.mjs` (one step naming every failing
+      # assertion), so no later step depends on it.
+      - name: seam ledger (#44 §6 reds must equal tests/deliberate-reds.mjs — runs last)
+        run: npm run test:seams
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: runtime-tests-logs
+          path: ~/.npm/_logs/
+          retention-days: 7
+
+  wsl-gate:
+    name: real-WSL hard gates (windows + WSL${{ matrix.wslVersion }} Ubuntu, ${{ matrix.plane }} plane)
+    runs-on: windows-latest
+    timeout-minutes: 35
+    needs: lint-build
+    # Both kernel shapes, on the same distribution. The reading that decides "this command is waiting
+    # for a keyboard" is a `/proc` walk, and WSL1 answers it differently from WSL2: `wchan` reads `0`
+    # for every process and no fd points at a pts, so a keyboard wait there looked, for two rounds,
+    # exactly like a command that was merely slow. One runner version could not see that, and the
+    # product difference is real — measured on the WSL1 frame: five cells, all in that family, with the
+    # call burning its 20 s and 60 s deadlines.
+    strategy:
+      fail-fast: false
+      # Two axes, and the second one is a latency fix rather than a new claim.
+      #
+      # The src and lib passes are independent processes that already own separate fixture roots, and
+      # they were being run one after the other inside a single job. On WSL1 that serial pair is 430 s
+      # of the job's 565 s gate step (measured, run 37727075063), and the job is the whole critical
+      # path of the workflow — 12 min 23 s against WSL2's 7 min 14 s. Split across runners they run at
+      # the same time with no contention to account for.
+      #
+      # Why not two background processes in one job: these gates assert their own timings
+      # (`stays.ms < 3_000` for the pager cell, `sleeping.ms > 3_500` for the quiet-command sentinel),
+      # and the pager cell has already flaked once at 6 187 ms against its 3 000 ms bound **on the WSL1
+      # runner with nothing else running**. Two shells against one 9P share is load that runner is not
+      # obliged to carry. A local A/B on WSL2 (cold serial 140 s / warm serial 131 s / two planes
+      # concurrent 131 s, per-check timings unchanged) says concurrency does not distort the readings
+      # *there*; WSL1 is the environment with the thin margin and it cannot be measured off a runner,
+      # so the split is the form of parallelism that does not depend on winning that bet.
+      #
+      # `plane-matrix.mjs` records the same judgement for its 32 cells: its own root per cell, and
+      # still one at a time.
+      matrix:
+        wslVersion: [1, 2]
+        plane: [src, lib]
+    defaults:
+      run:
+        shell: bash
+    env:
+      WSL_COMPAT_DISTRO: Ubuntu-24.04
+      WSL_COMPAT_USER: root
+      # NOTE: do NOT set WSL_COMPAT_ROOT here — the drivers' built-in default
+      # (/tmp/dsh-wsl-compat, a Linux-side path) is what they need, and the
+      # Windows bash runner rewrites POSIX-path-shaped env values (frame 3:
+      # WSL_COMPAT_ROOT=/tmp/… reached node as C:\tmp\…).
+      WSL_COMPAT_RELAY_CWD: '\\wsl.localhost\Ubuntu-24.04\tmp\dsh-wsl-relay-ws'
+      WSL_COMPAT_DRIVE_CWD: 'C:\'
+      # search-real's Windows-/mnt assertion: point it at this checkout's own
+      # tests dir (the value baked into the script names the maintainer
+      # machine's deployed copy under D:\ProgramData).
+      WSL_COMPAT_DRIVE_PATH: ${{ github.workspace }}\tests
+      TMP: 'C:\tmp'
+      TEMP: 'C:\tmp'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: install pinned @deepseek-ai host packages
+        run: node ci/install-pinned.mjs
+      - name: provision WSL${{ matrix.wslVersion }} Ubuntu
+        uses: Vampire/setup-wsl@v3
+        with:
+          wsl-version: ${{ matrix.wslVersion }}
+          distribution: Ubuntu-24.04
+          set-as-default: 'true'
+          systemd: 'false'
+          use-headless: 'false'
+      - name: pin the distro to WSL${{ matrix.wslVersion }} and the default-distro registry keys
+        run: |
+          set -u
+          want=${{ matrix.wslVersion }}
+          v=$(wsl.exe -l -v 2>/dev/null | tr -d '\0' | grep -i ubuntu | grep -oE '[12]$' || true)
+          if [ "$v" != "$want" ]; then
+            echo "instance is VERSION=${v:-unknown}; converting to $want (conversion does not need Hyper-V)"
+            wsl.exe --set-version Ubuntu-24.04 "$want" 2>&1 | tr -d '\0' | tail -2
+          fi
+          wsl.exe -l -v 2>/dev/null | tr -d '\0' | grep -iE "ubuntu.*[[:space:]]${want}$" || { echo "RED — Ubuntu-24.04 is not running as WSL${want}"; exit 1; }
+          wsl.exe --set-default Ubuntu-24.04
+      - name: fixture preparation (bounded keep-warm so the 9P share stays visible)
+        run: |
+          mkdir -p /c/tmp
+          # The keeper has to outlast BOTH planes. The 9P share stops answering when the distribution
+          # idles out, and a Windows spawn into `\\wsl.localhost\…` reports that as
+          # `spawn <program> ENOENT` — which is how the WSL2 arm's second pass came to look like a
+          # missing node binary. 2400 s covers this job's own 35-minute bound.
+          wsl.exe -d Ubuntu-24.04 -- bash -c 'mkdir -p /tmp/dsh-wsl-relay-ws /tmp/dsh-wsl-compat /root/symprobe/ws && (nohup bash -c "for i in \$(seq 1 40); do sleep 60; done" >/dev/null 2>&1 & echo kept-alive)'
+      - name: preflight diagnostics (always collected before the gates)
+        run: |
+          mkdir -p logs
+          { wsl.exe --version 2>&1; wsl.exe -l -v 2>&1; wsl.exe -d Ubuntu-24.04 -- uname -a 2>&1;
+            wsl.exe -d Ubuntu-24.04 -- bash -c 'grep --version | head -1; find --version | head -1; whoami'; } | tr -d '\0' > logs/preflight-wsl.log 2>&1 || true
+          node -e 'const fs=require("node:fs");for(const p of ["\\\\wsl.localhost\\Ubuntu-24.04\\tmp","\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\dsh-wsl-relay-ws"])console.log(p, fs.existsSync(p)?"present":"ABSENT")' > logs/preflight-unc.log 2>&1 || true
+          cat logs/preflight-wsl.log logs/preflight-unc.log
+      - name: build (smoke-built / shell-extra / client consume lib/)
+        run: npm run build
+      - name: win32-semantics unit files (wsl-skills + fs-policy assume drive-shaped cwd)
+        run: npm run test:win32
+      - name: run the src-plane gates
+        # The src pass — the behaviour the gates had before `lib` was ever loaded. `lib/` is what
+        # ships (issue #44 §1), so this half is the comparison arm rather than the product claim: it is
+        # kept because a difference between the planes is exactly the signal the second pass exists to
+        # catch, and it now runs on its own runner instead of standing in front of the lib pass.
+        if: matrix.plane == 'src'
+        run: |
+          # GitHub's bash runs with -e: every guard below must be compound,
+          # or the first red kills the loop and the remaining gates go dark
+          # (frame 3 did exactly that after shell-extra).
+          FAIL=0
+          # `$SECONDS` per gate, printed next to its rc: the gate step is a dozen drivers in one
+          # shell, and without this line the only way to learn *which* driver owned the frame's
+          # wall time is to download the log artifacts and read their JSON readings — which is
+          # exactly how the 215-second driver behind this branch's timing note was found.
+          run_one() {
+            local name="$1"; shift
+            local rc=0
+            local t0=$SECONDS
+            echo "::group::$name"
+            "$@" > "logs/$name.log" 2>&1 || rc=$?
+            echo "rc=$rc"
+            echo "elapsed=$(( SECONDS - t0 ))s"
+            # `tail -6` alone was not attribution: a driver that runs 45 of 72 cells leaves its
+            # summary line, its failing cells above the window, and the frame read as one red with
+            # no name attached. Print the verdict line, every FAIL, and the short-run guard's own
+            # sentence — then the tail for context.
+            grep -aE "checks passed|bash-session-real: RED|  FAIL" "logs/$name.log" 2>/dev/null | head -25 || true
+            # The session driver prints its whole log rather than a six-line tail: every one of its
+            # cells carries the milliseconds it took, and a green frame used to record none of them —
+            # so a threshold question ("how close did that run get?") could only be answered from the
+            # downloaded artifacts, which is how the 3911 ms pager reading stayed invisible.
+            if [ "$name" = bash-session-real ]; then cat "logs/$name.log" || true; else tail -6 "logs/$name.log" || true; fi
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then FAIL=1; fi
+            return 0
+          }
+          run_one smoke node --experimental-strip-types tests/smoke.ts
+          run_one exec-shape node --experimental-strip-types tests/exec-shape.mjs
+          run_one shell-extra node tests/shell-extra.mjs
+          run_one make-smoke-built node scripts/make-smoke-built.mjs
+          run_one smoke-built node --experimental-strip-types tests/smoke-built.ts
+          run_one fs-real node --experimental-strip-types scripts/compatibility/fs-real.mjs
+          run_one skills-real node --experimental-strip-types scripts/compatibility/skills-real.mjs
+          run_one search-real node --experimental-strip-types scripts/compatibility/search-real.mjs
+          run_one relay-real node --experimental-strip-types scripts/compatibility/relay-real.mjs
+          # The readiness contract against a login pass that rewrites it. Own fixture root, and
+          # MSYS_NO_PATHCONV=1 on the assignment, for the same reason as search-real above.
+          MSYS_NO_PATHCONV=1 WSL_COMPAT_ROOT=/tmp/dsh-wsl-relay-profile node --experimental-strip-types scripts/compatibility/relay-profile-real.mjs > logs/relay-profile-real.log 2>&1 || { echo "rc=$?"; tail -8 logs/relay-profile-real.log || true; FAIL=1; }
+          run_one tool-bash-real node --experimental-strip-types scripts/compatibility/tool-bash-real.mjs
+          run_one bash-session-real node --experimental-strip-types scripts/compatibility/bash-session-real.mjs
+          # The two readings that driver leans on (the quiet window for a spill file, and the
+          # re-read when the two settles disagree) get their own control first: it needs no
+          # distribution, so a broken reading is caught before the WSL matrix spends minutes on it.
+          node --experimental-strip-types scripts/compatibility/bash-parity-real.mjs --self-test > logs/parity-selftest.log 2>&1 || { echo "self-test rc=$?"; cat logs/parity-selftest.log; FAIL=1; }
+          MSYS_NO_PATHCONV=1 WSL_COMPAT_ROOT=/tmp/dsh-wsl-parity node --experimental-strip-types scripts/compatibility/bash-parity-real.mjs > logs/bash-parity-real.log 2>&1 || { echo "rc=$?"; tail -8 logs/bash-parity-real.log || true; FAIL=1; }
+          exit $FAIL
+      - name: run the lib-plane gates against the shipped bundle
+        if: matrix.plane == 'lib'
+        run: |
+          FAIL=0
+          # The same gates against the shipped bundle. The default plane stays `src` until
+          # this pass has been green twice (issue #44 §1); a run is only credited to a plane
+          # if its log carries the matching `plane-module:` line, checked below. Each pass
+          # gets its own fixture root because these drivers create rather than clean their
+          # tree — two passes over one /tmp/dsh-wsl-compat is a race, not a rerun.
+          # `|| { tail; FAIL=1; }` rather than `|| echo rc=$?`: a lib-plane failure that
+          # leaves no reason in the step log is a red nobody can attribute.
+          run_lib() {
+            local name="$1"; shift
+            local rc=0
+            echo "::group::lib-$name"
+            DSH_WSL_TEST_PLANE=lib "$@" > "logs/lib-$name.log" 2>&1 || rc=$?
+            echo "rc=$rc"
+            grep -aE "  FAIL|: RED|checks passed" "logs/lib-$name.log" 2>/dev/null | head -20 || true
+            # Same as the `src` side: the session driver's per-cell milliseconds are the reading a
+            # threshold is judged from, and a green frame must carry them too.
+            if [ "$name" = bash-session-real ]; then cat "logs/lib-$name.log" || true; else tail -8 "logs/lib-$name.log" || true; fi
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then FAIL=1; fi
+            return 0
+          }
+          # fs-real takes its root from the distro's own $HOME and relay-real from a
+          # Windows-shaped variable, so neither needs a second root: only search-real reads
+          # WSL_COMPAT_ROOT, and it must be handed over with MSYS_NO_PATHCONV=1. Without that
+          # the Windows bash runner rewrites `/tmp/dsh-wsl-lib` into `C:\tmp\dsh-wsl-lib` and
+          # the driver assembles `\\wsl.localhost\Ubuntu-24.04C:\tmp\…` — frame
+          # 36736537229 proved it (errno -4094, syscall mkdir). Same trap ci.yml already
+          # documents for WSL_COMPAT_ROOT at the top of this job.
+          run_lib fs-real node --experimental-strip-types scripts/compatibility/fs-real.mjs
+          MSYS_NO_PATHCONV=1 DSH_WSL_TEST_PLANE=lib WSL_COMPAT_ROOT=/tmp/dsh-wsl-lib node --experimental-strip-types scripts/compatibility/search-real.mjs > logs/lib-search-real.log 2>&1 || { echo "rc=$?"; tail -8 logs/lib-search-real.log || true; FAIL=1; }
+          run_lib relay-real node --experimental-strip-types scripts/compatibility/relay-real.mjs
+          MSYS_NO_PATHCONV=1 DSH_WSL_TEST_PLANE=lib WSL_COMPAT_ROOT=/tmp/dsh-wsl-relay-profile-lib node --experimental-strip-types scripts/compatibility/relay-profile-real.mjs > logs/lib-relay-profile-real.log 2>&1 || { echo "rc=$?"; tail -8 logs/lib-relay-profile-real.log || true; FAIL=1; }
+          run_lib tool-bash-real node --experimental-strip-types scripts/compatibility/tool-bash-real.mjs
+          run_lib bash-session-real node --experimental-strip-types scripts/compatibility/bash-session-real.mjs
+          node --experimental-strip-types scripts/compatibility/bash-parity-real.mjs --self-test > logs/lib-parity-selftest.log 2>&1 || { echo "self-test rc=$?"; cat logs/lib-parity-selftest.log; FAIL=1; }
+          MSYS_NO_PATHCONV=1 DSH_WSL_TEST_PLANE=lib WSL_COMPAT_ROOT=/tmp/dsh-wsl-parity-lib node --experimental-strip-types scripts/compatibility/bash-parity-real.mjs > logs/lib-bash-parity-real.log 2>&1 || { echo "rc=$?"; tail -8 logs/lib-bash-parity-real.log || true; FAIL=1; }
+          # skills-real is deliberately not attempted under `lib`: tsdown declares no entry for
+          # the provider (the class is file-local to lib/index.js:1122) and plane.mjs throws
+          # rather than falling back to src. Adding the entry changes what users install, so it
+          # is a maintainer decision, not a night-run side effect.
+          exit $FAIL
+      - name: boot a real host and reach WSL through its own registry
+        # The product's **own** loader, booted, and then WSL reached through the registry the host hands
+        # a model. That is the closest this repository gets to opening the app and typing the command:
+        # same `runProfile`, same plugin, same tool descriptor, same `wsl.exe`, and the model's own call
+        # shape rather than a hand-built one.
+        #
+        # These two probes were written for issue #51 and have been **manual-only ever since** —
+        # `test:host-probe` and `test:command-census` are defined in `package.json` and referenced by no
+        # workflow — so until this step the only tests here that boot a real host were the two nobody
+        # ran. The gate tiers next door mount a hand-built cordis world; this one boots the loader.
+        #
+        # Both run at once. Neither asserts a timing bound — elapsed milliseconds are *reported* as
+        # evidence and every assertion is on a string — and each owns its own `DSH_HOME`, so overlap can
+        # slow a reading but cannot change a verdict. Measured together on this machine at ~15 s against
+        # this job's 283 s of gates, which makes the parallelism insurance rather than a rescue: neither
+        # probe's cost can grow into the other's budget.
+        #
+        # On the `lib` plane because that is the artifact this job exists to exercise: the probes load
+        # `lib/wsl-bash-tool.js` and `lib/shell.js`.
+        if: matrix.plane == 'lib'
+        run: |
+          mkdir -p logs
+          FAIL=0
+          DSH_WSL_DISTRO=Ubuntu-24.04 npm run test:host-probe > logs/host-probe.log 2>&1 &
+          PROBE=$!
+          DSH_WSL_DISTRO=Ubuntu-24.04 npm run test:command-census > logs/command-census.log 2>&1 &
+          CENSUS=$!
+          wait "$PROBE" || FAIL=1
+          wait "$CENSUS" || FAIL=1
+          for name in host-probe command-census; do
+            echo "::group::$name"
+            grep -aE '"verdict"|"passed"|"total"|"(ok|shape|name|evidence)"|^FAIL' "logs/$name.log" | head -40 || true
+            tail -5 "logs/$name.log" || true
+            echo "::endgroup::"
+          done
+          exit $FAIL
+      - name: every gate must say which plane it loaded (src)
+        # `always()` so that a red gate still gets its attribution check, and the matrix condition on
+        # top because this job only produced one plane's logs — asking for the other's would fail on a
+        # missing file and turn the split itself into a red.
+        if: always() && matrix.plane == 'src'
+        run: |
+          RC=0
+          # The module key is what plane.mjs prints (`fs`, `search`, …), not the driver's file
+          # name — passing `search-real` here demanded a line no driver can emit.
+          node scripts/verify-plane-log.mjs logs/fs-real.log src fs || RC=1
+          node scripts/verify-plane-log.mjs logs/search-real.log src search || RC=1
+          node scripts/verify-plane-log.mjs logs/skills-real.log src skills || RC=1
+          node scripts/verify-plane-log.mjs logs/relay-real.log src relay || RC=1
+          node scripts/verify-plane-log.mjs logs/relay-profile-real.log src relay || RC=1
+          node scripts/verify-plane-log.mjs logs/tool-bash-real.log src shell || RC=1
+          node scripts/verify-plane-log.mjs logs/bash-session-real.log src wsl-bash-tool || RC=1
+          node scripts/verify-plane-log.mjs logs/bash-parity-real.log src wsl-bash-tool || RC=1
+          echo "plane evidence collected"
+          exit $RC
+      - name: every gate must say which plane it loaded (lib)
+        if: always() && matrix.plane == 'lib'
+        run: |
+          RC=0
+          node scripts/verify-plane-log.mjs logs/lib-fs-real.log lib fs || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-search-real.log lib search || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-relay-real.log lib relay || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-relay-profile-real.log lib relay || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-tool-bash-real.log lib shell || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-bash-session-real.log lib wsl-bash-tool || RC=1
+          node scripts/verify-plane-log.mjs logs/lib-bash-parity-real.log lib wsl-bash-tool || RC=1
+          echo "plane evidence collected"
+          exit $RC
+      - name: postflight (share state at the moment of failure)
+        if: failure()
+        run: |
+          mkdir -p logs
+          { wsl.exe -l -v 2>&1; wsl.exe -d Ubuntu-24.04 -- bash -c 'ls -la /tmp/dsh-wsl-compat 2>&1; ls -la /tmp/dsh-wsl-relay-ws 2>&1'; } | tr -d '\0' > logs/postflight.log 2>&1 || true
+          cat logs/postflight.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wsl-gate-logs-wsl${{ matrix.wslVersion }}-${{ matrix.plane }}
+          path: logs/
+          retention-days: 7
